@@ -220,11 +220,52 @@ size_t dump_mac_stats(gNB_MAC_INST *gNB, char *output, size_t strlen, bool reset
       const nr_lc_config_t *c = seq_arr_at(&sched_ctrl->lc_config, i);
       output = st_append(output,
                          end,
-                         "UE %04x: LCID %d: TX %14"PRIu64" RX %14"PRIu64" bytes\n",
+                         "UE %04x: LCID %d nssai=%d.0x%06x: TX %14"PRIu64" RX %14"PRIu64" bytes\n",
                          UE->rnti,
                          c->lcid,
+                         c->nssai.sst,
+                         c->nssai.sd,
                          stats->dl.lc_bytes[c->lcid],
                          stats->ul.lc_bytes[c->lcid]);
+    }
+  }
+
+  /* Per-slice config + DL RB usage */
+  if (gNB->slice_config.num > 0) {
+    const char *algo_name =
+        gNB->dl_slice_algo == nr_dl_rrm_ratio ? "rrm" : gNB->dl_slice_algo == nr_dl_nvs ? "nvs" : "custom";
+    for (int i = 0; i < gNB->slice_config.num; i++) {
+      nr_slice_t *slice = &gNB->slice_config.s[i];
+      output = st_append(output,
+                         end,
+                         "slice nssai=%d.0x%06x (%s) algo=%s",
+                         slice->nssai.sst,
+                         slice->nssai.sd,
+                         slice->label ? slice->label : "?",
+                         algo_name);
+      if (gNB->dl_slice_algo == nr_dl_rrm_ratio && slice->algo_data) {
+        const nr_slice_rrm_ratio_params_t *p = slice->algo_data;
+        output = st_append(output, end, " config[dedicated=%d min=%d max=%d]", p->dedicated_ratio, p->min_ratio, p->max_ratio);
+      } else if (gNB->dl_slice_algo == nr_dl_nvs && slice->algo_data) {
+        const nr_slice_nvs_params_t *p = slice->algo_data;
+        output = st_append(output, end, " config[pct_reserved=%d]", p->pct_reserved);
+      }
+      float budget_pct = slice->stat_rbs_avail > 0 ? 100.0 * slice->stat_rbs_budget / slice->stat_rbs_avail : 0.0;
+      float used_pct = slice->stat_rbs_avail > 0 ? 100.0 * slice->stat_rbs_used / slice->stat_rbs_avail : 0.0;
+      uint64_t unused_rbs = slice->stat_rbs_budget - slice->stat_rbs_used;
+      output = st_append(output,
+                         end,
+                         ": budget %"PRIu64"/%"PRIu64" RBs (%.1f%%), used %"PRIu64
+                         " RBs (%.1f%%), unused %"PRIu64" RBs\n",
+                         slice->stat_rbs_budget,
+                         slice->stat_rbs_avail,
+                         budget_pct,
+                         slice->stat_rbs_used,
+                         used_pct,
+                         unused_rbs);
+      slice->stat_rbs_budget = 0;
+      slice->stat_rbs_used = 0;
+      slice->stat_rbs_avail = 0;
     }
   }
   DevAssert(output <= end);

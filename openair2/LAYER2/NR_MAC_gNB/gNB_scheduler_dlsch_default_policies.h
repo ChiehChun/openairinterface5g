@@ -6,6 +6,8 @@
 #define GNB_SCHEDULER_DLSCH_DEFAULT_POLICIES_H
 
 #include "LAYER2/NR_MAC_gNB/nr_mac_gNB.h"
+#include "slicing/nr_slicing_rrm_ratio.h"
+#include "slicing/nr_slicing_nvs.h"
 
 void nr_dl_ri_pmi_select_default(const gNB_MAC_INST *mac, nr_dl_candidate_t *candidates, int n_candidates);
 void nr_dl_mcs_select_default(const gNB_MAC_INST *mac, nr_dl_candidate_t *candidates, int n_candidates);
@@ -26,5 +28,13 @@ void nr_dl_lcid_alloc_default(const gNB_MAC_INST *mac,
                               const nr_dl_candidate_t *candidate,
                               int tbs_available,
                               int lcid_alloc[NR_MAX_NUM_LCID]);
+
+int nr_dl_two_level_scheduler(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates);
+
+int nr_dl_proportional_fair_budgeted(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates, int rb_budget);
+
+void nr_dl_log_group_budget(const nr_dl_sched_params_t *params, nr_slice_config_t *slice_config, const nr_dl_group_t *group, int rb_budget, int bwp_size);
+
+int nr_dl_log_slice_usage(const nr_dl_sched_params_t *params, nr_slice_config_t *slice_config, const nr_dl_group_t *group, int bwp_size);
 
 #endif /* GNB_SCHEDULER_DLSCH_DEFAULT_POLICIES_H */

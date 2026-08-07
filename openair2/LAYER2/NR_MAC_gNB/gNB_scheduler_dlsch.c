@@ -478,7 +478,13 @@ static int collect_dl_candidates(gNB_MAC_INST *mac,
     nssai_t nssai = {0, 0xFFFFFF};
     for (int j = 0; j < seq_arr_size(&sched_ctrl->lc_config); j++) {
       const nr_lc_config_t *c = seq_arr_at(&sched_ctrl->lc_config, j);
-      if (c->lcid >= 4) {
+
+      // Only let a DRB with actual queued data determine nssai. A DRB can exist in
+      // lc_config (added by RRC/E1AP) before the UE has even been told about it via
+      // RRCReconfiguration, in which case it has zero backlog; classifying on its mere
+      // existence would pull this candidate's still-pending SRB bytes (e.g. that very
+      // RRCReconfiguration) into the DRB's slice before it carries any traffic.
+      if (c->lcid >= 4 && sched_ctrl->rlc_status[c->lcid].bytes_in_buffer > 0) {
         lc_priority = c->priority;
         nssai = c->nssai;
         for (int q = 0; q < NR_MAX_NUM_QFI; q++) {
