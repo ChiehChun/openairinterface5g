@@ -17,8 +17,8 @@ nr_slice_nvs_params_t *nr_slice_nvs_params_new(int pct_reserved);
 
 int nr_dl_nvs(const nr_dl_sched_params_t *params,
               nr_slice_config_t *slice_config,
-              nr_dl_group_t groups[NR_MAX_NUM_SLICES + 1],
-              int n_groups,
+              nr_dl_candidate_t *candidates,
+              int n_candidates,
               int bwp_size);
 
 #endif /* NR_SLICING_NVS_H */

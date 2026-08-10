@@ -241,7 +241,7 @@ size_t dump_mac_stats(gNB_MAC_INST *gNB, char *output, size_t strlen, bool reset
                          "slice nssai=%d.0x%06x (%s) algo=%s",
                          slice->nssai.sst,
                          slice->nssai.sd,
-                         slice->label ? slice->label : "?",
+                         slice->label ? slice->label : "label?",
                          algo_name);
       if (gNB->dl_slice_algo == nr_dl_rrm_ratio && slice->algo_data) {
         const nr_slice_rrm_ratio_params_t *p = slice->algo_data;

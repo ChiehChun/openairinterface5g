@@ -457,10 +457,15 @@ static int slice_add(char *buf, int debug, telnet_printfunc_t prnt)
     ERROR_MSG_RET("unknown algo '%s' (expected 'rrm' or 'nvs')\n", algo_str);
   }
 
+  nssai_t nssai = {.sst = sst, .sd = sd};
+  if (nssai.sst == 0 && nssai.sd == 0) {
+    free(algo_data);
+    ERROR_MSG_RET("nssai 0.0x000000 is reserved for the default/SRB slice and is managed automatically "
+                  "(see nr_slicing_ensure_default_slice_rrm()/_nvs())\n");
+  }
+
   gNB_MAC_INST *mac = RC.nrmac[0];
   AssertFatal(mac != NULL, "need MAC\n");
-
-  nssai_t nssai = {.sst = sst, .sd = sd};
 
   NR_SCHED_LOCK(&mac->sched_lock);
   if (mac->dl_slice_algo && mac->dl_slice_algo != target_algo && mac->slice_config.num > 0) {
@@ -472,13 +477,13 @@ static int slice_add(char *buf, int debug, telnet_printfunc_t prnt)
   }
 
   if (target_algo == nr_dl_rrm_ratio) {
-    // min_ratio is a hard reservation out of the shared RB pool (see nr_dl_rrm_ratio()), so the
-    // total across all rrm slices must not exceed 100% or slices would silently starve each other.
     int existing_idx = find_slice_idx_by_nssai(&mac->slice_config, nssai);
     int total_min = min_ratio;
     for (int i = 0; i < mac->slice_config.num; i++) {
       if (i == existing_idx)
         continue;
+      if (mac->slice_config.s[i].nssai.sst == 0 && mac->slice_config.s[i].nssai.sd == 0)
+        continue; // reserved default slice, not a user commitment
       const nr_slice_rrm_ratio_params_t *p = mac->slice_config.s[i].algo_data;
       total_min += p->min_ratio;
     }
@@ -486,6 +491,22 @@ static int slice_add(char *buf, int debug, telnet_printfunc_t prnt)
       NR_SCHED_UNLOCK(&mac->sched_lock);
       free(algo_data);
       ERROR_MSG_RET("rejected: total min ratio across all rrm slices would be %d%% (>100%%)\n", total_min);
+    }
+  } else if (target_algo == nr_dl_nvs) {
+    int existing_idx = find_slice_idx_by_nssai(&mac->slice_config, nssai);
+    int total_pct = pct_reserved;
+    for (int i = 0; i < mac->slice_config.num; i++) {
+      if (i == existing_idx)
+        continue;
+      if (mac->slice_config.s[i].nssai.sst == 0 && mac->slice_config.s[i].nssai.sd == 0)
+        continue; // reserved default slice, not a user commitment
+      const nr_slice_nvs_params_t *p = mac->slice_config.s[i].algo_data;
+      total_pct += p->pct_reserved;
+    }
+    if (total_pct > 100) {
+      NR_SCHED_UNLOCK(&mac->sched_lock);
+      free(algo_data);
+      ERROR_MSG_RET("rejected: total pct_reserved across all nvs slices would be %d%% (>100%%)\n", total_pct);
     }
   }
 
@@ -498,6 +519,10 @@ static int slice_add(char *buf, int debug, telnet_printfunc_t prnt)
   mac->dl_slice_algo = target_algo;
   if (mac->dl_rb_alloc != nr_dl_two_level_scheduler)
     mac->dl_rb_alloc = nr_dl_two_level_scheduler;
+  if (target_algo == nr_dl_rrm_ratio)
+    nr_slicing_ensure_default_slice_rrm(&mac->slice_config);
+  else
+    nr_slicing_ensure_default_slice_nvs(&mac->slice_config);
   NR_SCHED_UNLOCK(&mac->sched_lock);
 
   if (target_algo == nr_dl_rrm_ratio)
@@ -531,12 +556,21 @@ static int slice_remove(char *buf, int debug, telnet_printfunc_t prnt)
   if (!parse_sd(sd_str, &sd))
     ERROR_MSG_RET("invalid sd '%s' (decimal or 0x-prefixed hex, 0-0xFFFFFF)\n", sd_str);
 
+  if (sst == 0 && sd == 0)
+    ERROR_MSG_RET("nssai 0.0x000000 is the reserved default/SRB slice and cannot be removed directly\n");
+
   gNB_MAC_INST *mac = RC.nrmac[0];
   AssertFatal(mac != NULL, "need MAC\n");
 
   nssai_t nssai = {.sst = sst, .sd = sd};
   NR_SCHED_LOCK(&mac->sched_lock);
   int removed = nr_slicing_remove_slice(&mac->slice_config, nssai);
+  if (removed && mac->slice_config.num > 0) {
+    if (mac->dl_slice_algo == nr_dl_rrm_ratio)
+      nr_slicing_ensure_default_slice_rrm(&mac->slice_config);
+    else if (mac->dl_slice_algo == nr_dl_nvs)
+      nr_slicing_ensure_default_slice_nvs(&mac->slice_config);
+  }
   NR_SCHED_UNLOCK(&mac->sched_lock);
 
   if (!removed)

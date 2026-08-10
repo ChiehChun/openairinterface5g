@@ -33,8 +33,16 @@ int nr_dl_two_level_scheduler(const nr_dl_sched_params_t *params, nr_dl_candidat
 
 int nr_dl_proportional_fair_budgeted(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates, int rb_budget);
 
+int nr_dl_schedule_retx(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates, int rb_budget, int *rb_used);
+
+int nr_dl_schedule_newtx_budgeted(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates, int rb_budget, int *rb_used);
+
 void nr_dl_log_group_budget(const nr_dl_sched_params_t *params, nr_slice_config_t *slice_config, const nr_dl_group_t *group, int rb_budget, int bwp_size);
 
 int nr_dl_log_slice_usage(const nr_dl_sched_params_t *params, nr_slice_config_t *slice_config, const nr_dl_group_t *group, int bwp_size);
+
+uint32_t nr_dl_slice_pending_bytes(int slice_idx, nr_dl_candidate_t *candidates, int n_candidates);
+
+void nr_dl_restrict_candidate_to_slice(const nr_slice_config_t *slice_config, int winner_idx, nr_dl_candidate_t *candidate);
 
 #endif /* GNB_SCHEDULER_DLSCH_DEFAULT_POLICIES_H */

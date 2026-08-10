@@ -683,6 +683,8 @@ typedef struct {
 
   /// total amount of data awaiting for this UE
   uint32_t num_total_bytes;
+  /// total amount of data awaiting for this UE, broken down by slice
+  uint32_t slice_pending_bytes[NR_MAX_NUM_SLICES];
   /// per-LC status data
   mac_rlc_status_resp_t rlc_status[NR_MAX_NUM_LCID];
 
@@ -1004,49 +1006,20 @@ typedef int (
 /// Sets candidate->scheduled = true for each accepted UE; returns the count.
 typedef int (*nr_dl_rb_alloc_fn)(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates);
 
-/// One group of contiguous, same-slice candidates, as produced by
-/// nr_dl_partition_candidates_by_slice() and passed to nr_dl_slice_algo_fn.
-/// slice_idx indexes into slice_config->s[] (slice_config->num denotes the
-/// "default" group of candidates matching no configured slice); candidates/
-/// count are that group's sub-range of the candidates array passed to
-/// nr_dl_two_level_scheduler() (already reordered into contiguous runs).
+/// Describes one slice's winning share of a slot: slice_idx into slice_config->s[], and the
+/// candidates/count it was scheduled with.
 typedef struct nr_dl_group_s {
   int slice_idx;
   nr_dl_candidate_t *candidates;
   int count;
 } nr_dl_group_t;
 
-/// Level-1 (inter-slice) slicing algorithm: owns the whole per-slot
-/// apportionment loop over groups[0..n_groups) and is the one that actually
-/// runs nr_dl_proportional_fair_budgeted() (the level-2 scheduler) for each
-/// group, in whatever order and with whatever RB budget it decides -- not a
-/// pure decision function handed back to a generic orchestrator, because
-/// how much of a group's budget it actually used (visible only after
-/// running the level-2 scheduler) can itself change a later group's budget
-/// -- e.g. nr_dl_rrm_ratio() hands back a slice's unused non-dedicated RBs
-/// to the shared pool for whoever it processes next, which a "decide
-/// everything up front" split cannot express. nr_dl_two_level_scheduler()
-/// just partitions candidates by slice and delegates the whole slot to
-/// this function; it returns the total number of UEs scheduled across all
-/// groups. groups[g].slice_idx (index slice_config->num denotes the
-/// "default" group of candidates matching no configured slice) is what an
-/// algorithm needs to look up a slice's algo_data/algo_state. See
-/// nr_dl_rrm_ratio() for a worked example (dedicated/min/max PRB
-/// percentages, 3GPP TS 28.541 RRMPolicyRatio, with dynamic reclaim) and
-/// nr_dl_nvs() for a very different one (time-domain winner-take-all: the
-/// winning group gets the whole BWP as its budget, everyone else 0).
-///
-/// slice_config is mutable so an algorithm can maintain its own per-slice
-/// runtime state across calls via nr_slice_t::algo_state (lazily allocated,
-/// e.g. nr_dl_nvs()'s fairness-deficit tracking) -- algorithms that don't
-/// need this (e.g. nr_dl_rrm_ratio(), which is stateless and recomputed
-/// fresh every slot) simply don't write through it. This is the pluggable
-/// "slicing algorithm" seam: swap gNB_MAC_INST::dl_slice_algo to change how
-/// slices share PRBs.
+/// Level-1 scheduler (inter-slice) slicing algorithm: decides which slice(s) get RBs this slot and runs
+/// the level-2 scheduler (intra-slice)  user algorithm for them; returns the total number of UEs scheduled.
 typedef int (*nr_dl_slice_algo_fn)(const nr_dl_sched_params_t *params,
                                    nr_slice_config_t *slice_config,
-                                   nr_dl_group_t groups[NR_MAX_NUM_SLICES + 1],
-                                   int n_groups,
+                                   nr_dl_candidate_t *candidates,
+                                   int n_candidates,
                                    int bwp_size);
 
 /// Per-LCID byte allocation: decides how many bytes each LCID gets within

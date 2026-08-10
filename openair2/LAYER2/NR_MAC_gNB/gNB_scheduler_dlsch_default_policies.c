@@ -183,14 +183,9 @@ static int compare_dl_pf_rb_ptrs(const void *a, const void *b)
   return (wa < wb) - (wa > wb);
 }
 
-int nr_dl_proportional_fair_budgeted(const nr_dl_sched_params_t *params,
-                                     nr_dl_candidate_t *candidates,
-                                     int n_candidates,
-                                     int rb_budget)
+int nr_dl_schedule_retx(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates, int rb_budget, int *rb_used)
 {
-  const int min_rbSize = 5;
   int n_scheduled = 0;
-  int rb_used = 0;
 
   /* Build pointer array sorted by PF priority (retx first, then highest weight).
    * Excludes candidates already scheduled by an earlier call so this function is
@@ -210,7 +205,7 @@ int nr_dl_proportional_fair_budgeted(const nr_dl_sched_params_t *params,
       continue;
 
     int needed_rbs = cand->retx_rbSize;
-    if (rb_used + needed_rbs > rb_budget)
+    if (*rb_used + needed_rbs > rb_budget)
       continue;
 
     uint16_t *vrb_map = params->vrb_map[cand->alloc_beam_idx];
@@ -225,16 +220,31 @@ int nr_dl_proportional_fair_budgeted(const nr_dl_sched_params_t *params,
                       &rbSize))
       continue;
 
-    rb_used += needed_rbs;
+    *rb_used += needed_rbs;
     COMMIT_ALLOC(params, cand, rbStart, needed_rbs, cand->sched_pdsch.mcs, n_scheduled);
   }
+
+  return n_scheduled;
+}
+
+int nr_dl_schedule_newtx_budgeted(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates, int rb_budget, int *rb_used)
+{
+  const int min_rbSize = 5;
+  int n_scheduled = 0;
+
+  nr_dl_candidate_t *order[MAX_MOBILES_PER_GNB];
+  int n_active = 0;
+  FOR_EACH_CANDIDATE(cand, candidates, n_candidates)
+  if (!cand->skipped && !cand->scheduled)
+    order[n_active++] = cand;
+  qsort(order, n_active, sizeof(*order), compare_dl_pf_rb_ptrs);
 
   /* Phase 2: No-data UEs (TA command or beam switch MAC CE, no RLC data) */
   for (int j = 0; j < n_active; j++) {
     nr_dl_candidate_t *cand = order[j];
     if (cand->is_retx || cand->pending_bytes > 0)
       continue;
-    if (rb_used + min_rbSize > rb_budget)
+    if (*rb_used + min_rbSize > rb_budget)
       continue;
 
     uint16_t *vrb_map = params->vrb_map[cand->alloc_beam_idx];
@@ -249,7 +259,7 @@ int nr_dl_proportional_fair_budgeted(const nr_dl_sched_params_t *params,
                       &rbSize))
       continue;
 
-    rb_used += min_rbSize;
+    *rb_used += min_rbSize;
     COMMIT_ALLOC(params, cand, rbStart, min_rbSize, cand->sched_pdsch.mcs, n_scheduled);
   }
 
@@ -259,13 +269,13 @@ int nr_dl_proportional_fair_budgeted(const nr_dl_sched_params_t *params,
     nr_dl_candidate_t *cand = order[j];
     if (cand->is_retx || cand->pending_bytes == 0)
       continue;
-    if (rb_budget - rb_used < min_rbSize)
+    if (rb_budget - *rb_used < min_rbSize)
       continue;
 
     int rbStart;
     uint16_t *vrb_map = params->vrb_map[cand->alloc_beam_idx];
     int max_rbSize = find_largest_free_block(vrb_map, cand->alloc_slbitmap, cand->bwp_start, cand->bwp_size, &rbStart);
-    max_rbSize = min(max_rbSize, rb_budget - rb_used);
+    max_rbSize = min(max_rbSize, rb_budget - *rb_used);
     if (max_rbSize < min_rbSize)
       continue;
 
@@ -291,10 +301,20 @@ int nr_dl_proportional_fair_budgeted(const nr_dl_sched_params_t *params,
                   &tbs,
                   &rbSize);
 
-    rb_used += rbSize;
+    *rb_used += rbSize;
     COMMIT_ALLOC(params, cand, rbStart, rbSize, mcs, n_scheduled);
   }
 
+  return n_scheduled;
+}
+
+int nr_dl_proportional_fair_budgeted(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates, int rb_budget)
+{
+  int rb_used = 0;
+  // Split out of nr_dl_proportional_fair() so slot-based slicing algorithms can
+  // run retransmissions across all slices' candidates before picking a per-slot winner.
+  int n_scheduled = nr_dl_schedule_retx(params, candidates, n_candidates, rb_budget, &rb_used);
+  n_scheduled += nr_dl_schedule_newtx_budgeted(params, candidates, n_candidates, rb_budget, &rb_used);
   return n_scheduled;
 }
 
@@ -304,72 +324,26 @@ int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_
   return nr_dl_proportional_fair_budgeted(params, candidates, n_candidates, MAX_BWP_SIZE);
 }
 
-static int nr_dl_partition_candidates_by_slice(const nr_slice_config_t *slice_config,
-                                               nr_dl_candidate_t *candidates,
-                                               int n_candidates,
-                                               nr_dl_group_t groups[NR_MAX_NUM_SLICES + 1])
-{
-  int slice_of[MAX_MOBILES_PER_GNB];
-  FOR_EACH_CANDIDATE(cand, candidates, n_candidates)
-  {
-    int idx = find_slice_idx_by_nssai(slice_config, cand->nssai);
-    slice_of[cand - candidates] = (idx >= 0) ? idx : slice_config->num;
-  }
-
-  nr_dl_candidate_t tmp[MAX_MOBILES_PER_GNB];
-  int n_groups = 0;
-  int written = 0;
-  /* one bucket per configured slice, plus one "default/unmatched" bucket */
-  for (int s = 0; s <= slice_config->num; s++) {
-    int count = 0;
-    for (int i = 0; i < n_candidates; i++) {
-      if (slice_of[i] == s)
-        tmp[written + count++] = candidates[i];
-    }
-    if (count == 0)
-      continue;
-    groups[n_groups].slice_idx = s;
-    groups[n_groups].candidates = &candidates[written];
-    groups[n_groups].count = count;
-    n_groups++;
-    written += count;
-  }
-  memcpy(candidates, tmp, n_candidates * sizeof(*candidates));
-  return n_groups;
-}
-
-// Logs and accumulates a group's RB budget decision into its slice's stat_rbs_budget, before scheduling runs.
 void nr_dl_log_group_budget(const nr_dl_sched_params_t *params,
                             nr_slice_config_t *slice_config,
                             const nr_dl_group_t *group,
                             int rb_budget,
                             int bwp_size)
 {
-  if (group->slice_idx == slice_config->num) {
-    LOG_D(NR_MAC,
-          "[%d.%d] decision: default/unmatched budget %d RBs (%.1f%% of %d)\n",
-          params->frame,
-          params->slot,
-          rb_budget,
-          100.0 * rb_budget / bwp_size,
-          bwp_size);
-  } else {
-    nr_slice_t *slice = &slice_config->s[group->slice_idx];
-    LOG_D(NR_MAC,
-          "[%d.%d] decision: slice nssai=%d.0x%06x (%s) budget %d RBs (%.1f%% of %d)\n",
-          params->frame,
-          params->slot,
-          slice->nssai.sst,
-          slice->nssai.sd,
-          slice->label ? slice->label : "?",
-          rb_budget,
-          100.0 * rb_budget / bwp_size,
-          bwp_size);
-    slice->stat_rbs_budget += rb_budget;
-  }
+  nr_slice_t *slice = &slice_config->s[group->slice_idx];
+  LOG_D(NR_MAC,
+        "[%d.%d] decision: slice nssai=%d.0x%06x (%s) budget %d RBs (%.1f%% of %d)\n",
+        params->frame,
+        params->slot,
+        slice->nssai.sst,
+        slice->nssai.sd,
+        slice->label ? slice->label : "?",
+        rb_budget,
+        100.0 * rb_budget / bwp_size,
+        bwp_size);
+  slice->stat_rbs_budget += rb_budget;
 }
 
-// Logs and accumulates a group's actual RB usage into its slice's stat_rbs_used/stat_rbs_avail; returns RBs used.
 int nr_dl_log_slice_usage(const nr_dl_sched_params_t *params,
                           nr_slice_config_t *slice_config,
                           const nr_dl_group_t *group,
@@ -395,31 +369,22 @@ int nr_dl_log_slice_usage(const nr_dl_sched_params_t *params,
   else
     snprintf(used_range, sizeof(used_range), "none");
 
-  if (group->slice_idx == slice_config->num) {
-    LOG_D(NR_MAC,
-          "[%d.%d] slice default/unmatched: %d RBs (%.1f%% of %d), used %s\n",
-          params->frame,
-          params->slot,
-          slice_rbs,
-          100.0 * slice_rbs / bwp_size,
-          bwp_size,
-          used_range);
-  } else {
-    nr_slice_t *slice = &slice_config->s[group->slice_idx];
-    LOG_D(NR_MAC,
-          "[%d.%d] slice nssai=%d.0x%06x (%s): %d RBs (%.1f%% of %d), used %s\n",
-          params->frame,
-          params->slot,
-          slice->nssai.sst,
-          slice->nssai.sd,
-          slice->label ? slice->label : "?",
-          slice_rbs,
-          100.0 * slice_rbs / bwp_size,
-          bwp_size,
-          used_range);
-    slice->stat_rbs_used += slice_rbs;
-    slice->stat_rbs_avail += bwp_size;
-  }
+  nr_slice_t *slice = &slice_config->s[group->slice_idx];
+  LOG_D(NR_MAC,
+        "[%d.%d] slice nssai=%d.0x%06x (%s): %d RBs (%.1f%% of %d), used %s\n",
+        params->frame,
+        params->slot,
+        slice->nssai.sst,
+        slice->nssai.sd,
+        slice->label ? slice->label : "?",
+        slice_rbs,
+        100.0 * slice_rbs / bwp_size,
+        bwp_size,
+        used_range);
+  slice->stat_rbs_used += slice_rbs;
+  // stat_rbs_avail is accumulated once per slot for every configured slice in
+  // nr_dl_two_level_scheduler() (not here), so it reflects the whole reporting window's total
+  // RBs regardless of which slice actually won each slot -- see that function for why.
   for (int c = 0; c < group->count; c++) {
     const nr_dl_candidate_t *cand = &group->candidates[c];
     if (cand->scheduled)
@@ -441,15 +406,51 @@ int nr_dl_two_level_scheduler(const nr_dl_sched_params_t *params, nr_dl_candidat
   if (slice_config->num == 0 || n_candidates == 0)
     return nr_dl_proportional_fair(params, candidates, n_candidates);
 
-  nr_dl_group_t groups[NR_MAX_NUM_SLICES + 1];
-  int n_groups = nr_dl_partition_candidates_by_slice(slice_config, candidates, n_candidates, groups);
-
   /* Assumes every candidate in this call shares the same BWP (true for the
    * common single-BWP deployments this first version targets). */
   const int bwp_size = candidates[0].bwp_size;
 
+  // Every configured slice "sees" this slot's full bwp_size as available, win or lose --
+  // accumulated here (once per slot, for every slice) rather than only for whichever slice wins,
+  // so stat_rbs_avail ends up as the whole reporting window's total RBs. That's what makes
+  // budget/used in the periodic stats dump (main.c) a real share-of-the-window percentage
+  // instead of always reading 100% (which is what "budget won this slot / RBs available this
+  // slot" trivially equals in a winner-take-all, one-slice-per-slot algorithm).
+  for (int s = 0; s < slice_config->num; s++)
+    slice_config->s[s].stat_rbs_avail += bwp_size;
+
   nr_dl_slice_algo_fn slice_algo = params->mac->dl_slice_algo ? params->mac->dl_slice_algo : nr_dl_rrm_ratio;
-  return slice_algo(params, slice_config, groups, n_groups, bwp_size);
+  return slice_algo(params, slice_config, candidates, n_candidates, bwp_size);
+}
+
+uint32_t nr_dl_slice_pending_bytes(int slice_idx, nr_dl_candidate_t *candidates, int n_candidates)
+{
+  uint32_t total = 0;
+  FOR_EACH_CANDIDATE(cand, candidates, n_candidates)
+  {
+    if (cand->is_retx)
+      continue;
+    total += cand->UE->UE_sched_ctrl.slice_pending_bytes[slice_idx];
+  }
+  return total;
+}
+
+void nr_dl_restrict_candidate_to_slice(const nr_slice_config_t *slice_config, int winner_idx, nr_dl_candidate_t *candidate)
+{
+  if (candidate->is_retx)
+    return;
+
+  NR_UE_sched_ctrl_t *sched_ctrl = &candidate->UE->UE_sched_ctrl;
+  // only pulls RLC data from LCIDs in the winning slice
+  for (int lcid = 0; lcid < NR_MAX_NUM_LCID; lcid++) {
+    if (candidate->pending_bytes_per_lcid[lcid] == 0)
+      continue;
+    const nr_lc_config_t *c = nr_mac_get_lc_config(sched_ctrl, lcid);
+    if (!c || !nr_slice_lc_matches(slice_config, winner_idx, c->nssai))
+      candidate->pending_bytes_per_lcid[lcid] = 0;
+  }
+  candidate->pending_bytes = sched_ctrl->slice_pending_bytes[winner_idx];
+  candidate->nssai = slice_config->s[winner_idx].nssai;
 }
 
 void nr_dl_lcid_alloc_default(const gNB_MAC_INST *mac,

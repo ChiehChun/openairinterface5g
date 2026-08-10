@@ -5,9 +5,12 @@
 #ifndef NR_SLICING_COMMON_H
 #define NR_SLICING_COMMON_H
 
+#include <stdbool.h>
 #include "common/platform_types.h"
 #include "common/5g_platform_types.h"
 #include "common/utils/nr/nr_common.h"
+
+#define NR_SLICE_DEFAULT_MIN_RATIO_FLOOR 5
 
 typedef struct nr_slice_s {
   nssai_t nssai;
@@ -28,10 +31,16 @@ typedef struct nr_slice_config_s {
 
 int find_slice_idx_by_nssai(const nr_slice_config_t *conf, nssai_t nssai);
 
+bool nr_slice_lc_matches(const nr_slice_config_t *slice_config, int slice_idx, nssai_t lc_nssai);
+
 int nr_slicing_addmod_slice(nr_slice_config_t *conf, nssai_t nssai, const char *label, void *algo_data);
 
 int nr_slicing_remove_slice(nr_slice_config_t *conf, nssai_t nssai);
 
 void nr_slicing_clear(nr_slice_config_t *conf);
+
+void nr_slicing_ensure_default_slice_rrm(nr_slice_config_t *conf);
+
+void nr_slicing_ensure_default_slice_nvs(nr_slice_config_t *conf);
 
 #endif /* NR_SLICING_COMMON_H */

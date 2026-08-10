@@ -26,17 +26,19 @@ nr_slice_nvs_params_t *nr_slice_nvs_params_new(int pct_reserved)
 
 int nr_dl_nvs(const nr_dl_sched_params_t *params,
              nr_slice_config_t *slice_config,
-             nr_dl_group_t groups[NR_MAX_NUM_SLICES + 1],
-             int n_groups,
+             nr_dl_candidate_t *candidates,
+             int n_candidates,
              int bwp_size)
 {
-  float max_w = 0.0f;
-  int max_g = -1;
-  for (int g = 0; g < n_groups; g++) {
-    int s = groups[g].slice_idx;
-    if (s == slice_config->num)
-      continue; /* default/unmatched bucket doesn't compete for the NVS weight */
+  int rb_used = 0;
+  /* Handle retransmissions across all slices before any slice winner is decided */
+  int n_scheduled = nr_dl_schedule_retx(params, candidates, n_candidates, bwp_size, &rb_used);
 
+  /* Pick the slice with the highest NVS weight among those with new-tx data this slot. The
+   * reserved default slice (nssai {0,0}) competes here like any other */
+  float max_w = 0.0f;
+  int winner = -1;
+  for (int s = 0; s < slice_config->num; s++) {
     nr_slice_t *slice = &slice_config->s[s];
     const nr_slice_nvs_params_t *p = slice->algo_data;
     nr_slice_nvs_state_t *st = slice->algo_state;
@@ -58,30 +60,28 @@ int nr_dl_nvs(const nr_dl_sched_params_t *params,
     st->exp = (1.0f - NR_NVS_BETA) * st->exp;
     st->won_last_round = false; /* overwritten below for the actual winner */
 
-    if (w > max_w) {
+    bool has_data = nr_dl_slice_pending_bytes(s, candidates, n_candidates) > 0;
+    if (has_data && w > max_w) {
       max_w = w;
-      max_g = g;
+      winner = s;
     }
   }
 
-  if (max_g >= 0) {
-    nr_slice_nvs_state_t *winner_st = slice_config->s[groups[max_g].slice_idx].algo_state;
-    winner_st->won_last_round = true;
-  }
+  if (winner < 0)
+    return n_scheduled; /* nothing to send this slot beyond the retransmissions above */
 
-  /* Exactly one group runs this slot, with the whole BWP as its budget --
-   * NVS arbitrates in the time domain, not the frequency domain: the NVS
-   * winner if one competed, otherwise the default/unmatched bucket (if
-   * present), same as any other uncapped fallback. Everyone else gets
-   * nothing (and isn't even worth logging a zero-budget decision for). */
-  int n_scheduled = 0;
-  for (int g = 0; g < n_groups; g++) {
-    bool this_group_runs = g == max_g || (max_g < 0 && groups[g].slice_idx == slice_config->num);
-    if (!this_group_runs)
-      continue;
-    nr_dl_log_group_budget(params, slice_config, &groups[g], bwp_size, bwp_size);
-    n_scheduled += nr_dl_proportional_fair_budgeted(params, groups[g].candidates, groups[g].count, bwp_size);
-    nr_dl_log_slice_usage(params, slice_config, &groups[g], bwp_size);
-  }
+  nr_slice_nvs_state_t *winner_st = slice_config->s[winner].algo_state;
+  winner_st->won_last_round = true;
+
+  /* Keep only the winning slice's data on each candidate */
+  for (int i = 0; i < n_candidates; i++)
+    nr_dl_restrict_candidate_to_slice(slice_config, winner, &candidates[i]);
+
+  /* Winner gets the whole slot as its budget -- NVS arbitrates in the time domain, not frequency */
+  const nr_dl_group_t winner_group = {.slice_idx = winner, .candidates = candidates, .count = n_candidates};
+  nr_dl_log_group_budget(params, slice_config, &winner_group, bwp_size - rb_used, bwp_size);
+  n_scheduled += nr_dl_schedule_newtx_budgeted(params, candidates, n_candidates, bwp_size, &rb_used);
+  nr_dl_log_slice_usage(params, slice_config, &winner_group, bwp_size);
+
   return n_scheduled;
 }

@@ -299,10 +299,11 @@ int nr_write_ce_dlsch_pdu(module_id_t module_idP,
   return offset;
 }
 
-static uint32_t update_dlsch_buffer(frame_t frame, slot_t slot, NR_UE_info_t *UE)
+static uint32_t update_dlsch_buffer(frame_t frame, slot_t slot, NR_UE_info_t *UE, const nr_slice_config_t *slice_config)
 {
   NR_UE_sched_ctrl_t *sched_ctrl = &UE->UE_sched_ctrl;
   sched_ctrl->num_total_bytes = 0;
+  memset(sched_ctrl->slice_pending_bytes, 0, sizeof(sched_ctrl->slice_pending_bytes));
   int dl_pdus_total = 0;
 
   logical_chan_id_t ch[NR_MAX_NUM_LCID] = {0};
@@ -329,6 +330,14 @@ static uint32_t update_dlsch_buffer(frame_t frame, slot_t slot, NR_UE_info_t *UE
     sched_ctrl->rlc_status[lcid] = ret[i];
     dl_pdus_total += sched_ctrl->rlc_status[lcid].pdus_in_buffer;
     sched_ctrl->num_total_bytes += sched_ctrl->rlc_status[lcid].bytes_in_buffer;
+
+    if (slice_config->num > 0) {
+      const nr_lc_config_t *c = nr_mac_get_lc_config(sched_ctrl, lcid);
+      for (int s = 0; c && s < slice_config->num; s++)
+        if (nr_slice_lc_matches(slice_config, s, c->nssai))
+          sched_ctrl->slice_pending_bytes[s] += ret[i].bytes_in_buffer;
+    }
+
     LOG_D(MAC,
           "%4d.%2d UE %04x LCID %d status: %d bytes, %d PDUs, total buffer %d bytes %d PDUs\n",
           frame,
@@ -538,7 +547,7 @@ static int collect_dl_candidates(gNB_MAC_INST *mac,
       if (sched_ctrl->available_dl_harq.head < 0)
         continue;
 
-      update_dlsch_buffer(frame, slot, UE);
+      update_dlsch_buffer(frame, slot, UE, &mac->slice_config);
 
       if (!dlsch_to_schedule(sched_ctrl))
         continue;
@@ -854,7 +863,7 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
                     l,
                     sched_pdsch.tda_info.nrOfSymbols,
                     dmrs.N_PRB_DMRS * dmrs.N_DMRS_SLOT,
-                    sched_ctrl->num_total_bytes + oh,
+                    cand->pending_bytes + oh,
                     5,
                     sched_pdsch.rbSize,
                     &sched_pdsch.tb_size,
@@ -1089,7 +1098,7 @@ static void generate_dl_mac_pdu(gNB_MAC_INST *mac,
     start_meas(&mac->rlc_data_req);
     int sdus = 0;
 
-    if (sched_ctrl->num_total_bytes > 0) {
+    if (candidate->pending_bytes > 0) {
       /* ask the LCID allocation policy how many bytes each LC gets */
       int lcid_alloc[NR_MAX_NUM_LCID] = {0};
       mac->dl_lcid_alloc(mac, candidate, bufEnd - buf, lcid_alloc);
