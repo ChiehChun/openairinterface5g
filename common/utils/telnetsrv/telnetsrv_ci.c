@@ -8,6 +8,7 @@
  */
 
 #include <sys/types.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
@@ -22,6 +23,9 @@
 #include "openair2/LAYER2/nr_rlc/nr_rlc_entity_am.h"
 #include "openair2/LAYER2/NR_MAC_gNB/mac_proto.h"
 #include "openair2/LAYER2/NR_MAC_gNB/mac_config.h"
+#include "openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch_default_policies.h"
+#include "openair2/LAYER2/NR_MAC_gNB/slicing/nr_slicing_rrm_ratio.h"
+#include "openair2/LAYER2/NR_MAC_gNB/slicing/nr_slicing_nvs.h"
 #include "openair2/RRC/NR/rrc_gNB_mobility.h"
 #include "openair3/NGAP/ngap_gNB_ue_context.h"
 #include "openair2/RRC/NR/rrc_gNB_du.h"
@@ -402,6 +406,177 @@ static int set_pusch_target_snr(char *buf, int debug, telnet_printfunc_t prnt)
   return 0;
 }
 
+// Parses "<sd>" as decimal or 0x-prefixed hex, 0-0xFFFFFF; writes *sd and returns true on success.
+static bool parse_sd(const char *str, uint32_t *sd)
+{
+  char *end;
+  long val = strtol(str, &end, 0);
+  if (*end != 0 || val < 0 || val > 0xFFFFFF)
+    return false;
+  *sd = (uint32_t)val;
+  return true;
+}
+
+// Adds/updates a slice ("slice_add rrm|nvs <sst> <sd> <label> <params...>"); switching algo families clears all existing slices first.
+static int slice_add(char *buf, int debug, telnet_printfunc_t prnt)
+{
+  UNUSED(debug);
+  if (!buf)
+    ERROR_MSG_RET("usage: slice_add <rrm|nvs> <sst> <sd> <label> <params...>\n"
+                  "  rrm: slice_add rrm <sst> <sd> <label> <dedicated> <min> <max>\n"
+                  "  nvs: slice_add nvs <sst> <sd> <label> <pct_reserved>\n");
+
+  char algo_str[8];
+  int sst;
+  char sd_str[32];
+  char label[64];
+  int consumed = 0;
+  int n = sscanf(buf, "%7s %d %31s %63s%n", algo_str, &sst, sd_str, label, &consumed);
+  if (n != 4)
+    ERROR_MSG_RET("usage: slice_add <rrm|nvs> <sst> <sd> <label> <params...>\n");
+
+  uint32_t sd;
+  if (!parse_sd(sd_str, &sd))
+    ERROR_MSG_RET("invalid sd '%s' (decimal or 0x-prefixed hex, 0-0xFFFFFF)\n", sd_str);
+
+  nr_dl_slice_algo_fn target_algo;
+  void *algo_data;
+  int dedicated = 0, min_ratio = 0, max_ratio = 0, pct_reserved = 0;
+  const char *rest = buf + consumed;
+  if (strcmp(algo_str, "rrm") == 0) {
+    if (sscanf(rest, "%d %d %d", &dedicated, &min_ratio, &max_ratio) != 3)
+      ERROR_MSG_RET("usage: slice_add rrm <sst> <sd> <label> <dedicated> <min> <max>\n");
+    target_algo = nr_dl_rrm_ratio;
+    algo_data = nr_slice_rrm_ratio_params_new(dedicated, min_ratio, max_ratio);
+  } else if (strcmp(algo_str, "nvs") == 0) {
+    if (sscanf(rest, "%d", &pct_reserved) != 1)
+      ERROR_MSG_RET("usage: slice_add nvs <sst> <sd> <label> <pct_reserved>\n");
+    target_algo = nr_dl_nvs;
+    algo_data = nr_slice_nvs_params_new(pct_reserved);
+  } else {
+    ERROR_MSG_RET("unknown algo '%s' (expected 'rrm' or 'nvs')\n", algo_str);
+  }
+
+  gNB_MAC_INST *mac = RC.nrmac[0];
+  AssertFatal(mac != NULL, "need MAC\n");
+
+  nssai_t nssai = {.sst = sst, .sd = sd};
+
+  NR_SCHED_LOCK(&mac->sched_lock);
+  if (mac->dl_slice_algo && mac->dl_slice_algo != target_algo && mac->slice_config.num > 0) {
+    prnt("WARN: switching slicing algorithm from %s to %s -- clearing %d existing slice(s)\n",
+         mac->dl_slice_algo == nr_dl_rrm_ratio ? "rrm" : mac->dl_slice_algo == nr_dl_nvs ? "nvs" : "custom",
+         algo_str,
+         mac->slice_config.num);
+    nr_slicing_clear(&mac->slice_config);
+  }
+
+  if (target_algo == nr_dl_rrm_ratio) {
+    // min_ratio is a hard reservation out of the shared RB pool (see nr_dl_rrm_ratio()), so the
+    // total across all rrm slices must not exceed 100% or slices would silently starve each other.
+    int existing_idx = find_slice_idx_by_nssai(&mac->slice_config, nssai);
+    int total_min = min_ratio;
+    for (int i = 0; i < mac->slice_config.num; i++) {
+      if (i == existing_idx)
+        continue;
+      const nr_slice_rrm_ratio_params_t *p = mac->slice_config.s[i].algo_data;
+      total_min += p->min_ratio;
+    }
+    if (total_min > 100) {
+      NR_SCHED_UNLOCK(&mac->sched_lock);
+      free(algo_data);
+      ERROR_MSG_RET("rejected: total min ratio across all rrm slices would be %d%% (>100%%)\n", total_min);
+    }
+  }
+
+  int idx = nr_slicing_addmod_slice(&mac->slice_config, nssai, label, algo_data);
+  if (idx < 0) {
+    NR_SCHED_UNLOCK(&mac->sched_lock);
+    free(algo_data);
+    ERROR_MSG_RET("could not add slice: config already has the max %d slices\n", NR_MAX_NUM_SLICES);
+  }
+  mac->dl_slice_algo = target_algo;
+  if (mac->dl_rb_alloc != nr_dl_two_level_scheduler)
+    mac->dl_rb_alloc = nr_dl_two_level_scheduler;
+  NR_SCHED_UNLOCK(&mac->sched_lock);
+
+  if (target_algo == nr_dl_rrm_ratio)
+    prnt("OK: slice[%d] algo=rrm nssai=%d.0x%06x label=%s dedicated=%d min=%d max=%d\n",
+         idx,
+         sst,
+         sd,
+         label,
+         dedicated,
+         min_ratio,
+         max_ratio);
+  else
+    prnt("OK: slice[%d] algo=nvs nssai=%d.0x%06x label=%s pct_reserved=%d\n", idx, sst, sd, label, pct_reserved);
+  return 0;
+}
+
+// Removes a slice matched by exact sst+sd ("slice_remove <sst> <sd>").
+static int slice_remove(char *buf, int debug, telnet_printfunc_t prnt)
+{
+  UNUSED(debug);
+  if (!buf)
+    ERROR_MSG_RET("usage: slice_remove <sst> <sd>\n");
+
+  int sst;
+  char sd_str[32];
+  int n = sscanf(buf, "%d %31s", &sst, sd_str);
+  if (n != 2)
+    ERROR_MSG_RET("usage: slice_remove <sst> <sd>\n");
+
+  uint32_t sd;
+  if (!parse_sd(sd_str, &sd))
+    ERROR_MSG_RET("invalid sd '%s' (decimal or 0x-prefixed hex, 0-0xFFFFFF)\n", sd_str);
+
+  gNB_MAC_INST *mac = RC.nrmac[0];
+  AssertFatal(mac != NULL, "need MAC\n");
+
+  nssai_t nssai = {.sst = sst, .sd = sd};
+  NR_SCHED_LOCK(&mac->sched_lock);
+  int removed = nr_slicing_remove_slice(&mac->slice_config, nssai);
+  NR_SCHED_UNLOCK(&mac->sched_lock);
+
+  if (!removed)
+    ERROR_MSG_RET("no slice with nssai=%d.0x%06x found\n", sst, sd);
+  prnt("OK: removed slice nssai=%d.0x%06x\n", sst, sd);
+  return 0;
+}
+
+// Lists currently configured slices and their algo/params ("slice_list", no arguments).
+static int slice_list(char *buf, int debug, telnet_printfunc_t prnt)
+{
+  UNUSED(debug);
+  if (buf)
+    ERROR_MSG_RET("no parameter allowed\n");
+
+  gNB_MAC_INST *mac = RC.nrmac[0];
+  AssertFatal(mac != NULL, "need MAC\n");
+
+  NR_SCHED_LOCK(&mac->sched_lock);
+  int num = mac->slice_config.num;
+  const char *algo_name =
+      mac->dl_slice_algo == nr_dl_rrm_ratio ? "rrm" : mac->dl_slice_algo == nr_dl_nvs ? "nvs" : mac->dl_slice_algo ? "custom" : "none";
+  prnt("%d slice(s) configured (dl_slice_algo %s):\n", num, algo_name);
+  for (int i = 0; i < num; i++) {
+    const nr_slice_t *s = &mac->slice_config.s[i];
+    prnt("  [%d] nssai=%d.0x%06x label=%s", i, s->nssai.sst, s->nssai.sd, s->label ? s->label : "?");
+    if (mac->dl_slice_algo == nr_dl_rrm_ratio && s->algo_data) {
+      const nr_slice_rrm_ratio_params_t *p = s->algo_data;
+      prnt(" dedicated=%d min=%d max=%d", p->dedicated_ratio, p->min_ratio, p->max_ratio);
+    } else if (mac->dl_slice_algo == nr_dl_nvs && s->algo_data) {
+      const nr_slice_nvs_params_t *p = s->algo_data;
+      prnt(" pct_reserved=%d", p->pct_reserved);
+    }
+    prnt("\n");
+  }
+  NR_SCHED_UNLOCK(&mac->sched_lock);
+  prnt("OK\n");
+  return 0;
+}
+
 static telnetshell_cmddef_t cicmds[] = {
     {"get_single_rnti", "", get_single_rnti},
     {"force_reestab", "[rnti(hex,opt)]", trigger_reestab},
@@ -415,6 +590,9 @@ static telnetshell_cmddef_t cicmds[] = {
     {"trigger_n2_ho", "[neighbour_pci(uint32_t),ueId(uint32_t)]", rrc_gNB_trigger_n2_ho},
     {"set_pusch_target_snr", "[somelongSNR(dec)]", set_pusch_target_snr},
     {"pdu_session_release", "[gNB_ue_ngap_id(int,opt)]", trigger_ngap_pdu_session_release},
+    {"slice_add", "rrm|nvs <sst> <sd> <label> <dedicated> <min> <max>|<pct_reserved>", slice_add},
+    {"slice_remove", "<sst> <sd>", slice_remove},
+    {"slice_list", "", slice_list},
     {"", "", NULL},
 };
 
