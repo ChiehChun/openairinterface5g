@@ -318,7 +318,7 @@ void create_ue_ip_if(const char *ipv4, const char *ipv6, int ue_id, int pdu_sess
 
   tun_config(ifname, ipv4, ipv6);
   if (ipv4) {
-    setup_ue_ipv4_route(ifname, ue_id, ipv4);
+    setup_ue_ipv4_route(ifname, ue_id, pdu_session_id, ipv4);
   }
 }
 
