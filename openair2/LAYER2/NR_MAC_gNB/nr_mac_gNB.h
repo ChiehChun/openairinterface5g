@@ -1006,14 +1006,6 @@ typedef int (
 /// Sets candidate->scheduled = true for each accepted UE; returns the count.
 typedef int (*nr_dl_rb_alloc_fn)(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates);
 
-/// Describes one slice's winning share of a slot: slice_idx into slice_config->s[], and the
-/// candidates/count it was scheduled with.
-typedef struct nr_dl_group_s {
-  int slice_idx;
-  nr_dl_candidate_t *candidates;
-  int count;
-} nr_dl_group_t;
-
 /// Level-1 scheduler (inter-slice) slicing algorithm: decides which slice(s) get RBs this slot and runs
 /// the level-2 scheduler (intra-slice)  user algorithm for them; returns the total number of UEs scheduled.
 typedef int (*nr_dl_slice_algo_fn)(const nr_dl_sched_params_t *params,

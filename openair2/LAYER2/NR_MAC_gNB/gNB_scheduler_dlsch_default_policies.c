@@ -324,13 +324,21 @@ int nr_dl_proportional_fair(const nr_dl_sched_params_t *params, nr_dl_candidate_
   return nr_dl_proportional_fair_budgeted(params, candidates, n_candidates, MAX_BWP_SIZE);
 }
 
-void nr_dl_log_group_budget(const nr_dl_sched_params_t *params,
-                            nr_slice_config_t *slice_config,
-                            const nr_dl_group_t *group,
-                            int rb_budget,
-                            int bwp_size)
+void nr_dl_lcid_alloc_default(const gNB_MAC_INST *mac,
+                              const nr_dl_candidate_t *candidate,
+                              int tbs_available,
+                              int lcid_alloc[NR_MAX_NUM_LCID])
 {
-  nr_slice_t *slice = &slice_config->s[group->slice_idx];
+  (void)mac;
+  (void)tbs_available;
+  memset(lcid_alloc, 0, NR_MAX_NUM_LCID * sizeof(int));
+  for (int lcid = 0; lcid < NR_MAX_NUM_LCID; lcid++)
+    lcid_alloc[lcid] = candidate->pending_bytes_per_lcid[lcid];
+}
+
+void nr_dl_log_group_budget(const nr_dl_sched_params_t *params, nr_slice_config_t *slice_config, int slice_idx, int rb_budget, int bwp_size)
+{
+  nr_slice_t *slice = &slice_config->s[slice_idx];
   LOG_D(NR_MAC,
         "[%d.%d] decision: slice nssai=%d.0x%06x (%s) budget %d RBs (%.1f%% of %d)\n",
         params->frame,
@@ -344,15 +352,12 @@ void nr_dl_log_group_budget(const nr_dl_sched_params_t *params,
   slice->stat_rbs_budget += rb_budget;
 }
 
-int nr_dl_log_slice_usage(const nr_dl_sched_params_t *params,
-                          nr_slice_config_t *slice_config,
-                          const nr_dl_group_t *group,
-                          int bwp_size)
+int nr_dl_log_slice_usage(const nr_dl_sched_params_t *params, nr_slice_config_t *slice_config, int slice_idx, const nr_dl_candidate_t *candidates, int n_candidates, int bwp_size)
 {
   int slice_rbs = 0;
   int min_rb = -1, max_rb = 0;
-  for (int c = 0; c < group->count; c++) {
-    const nr_dl_candidate_t *cand = &group->candidates[c];
+  for (int c = 0; c < n_candidates; c++) {
+    const nr_dl_candidate_t *cand = &candidates[c];
     if (cand->scheduled) {
       slice_rbs += cand->sched_pdsch.rbSize;
       int start = cand->sched_pdsch.rbStart;
@@ -369,7 +374,7 @@ int nr_dl_log_slice_usage(const nr_dl_sched_params_t *params,
   else
     snprintf(used_range, sizeof(used_range), "none");
 
-  nr_slice_t *slice = &slice_config->s[group->slice_idx];
+  nr_slice_t *slice = &slice_config->s[slice_idx];
   LOG_D(NR_MAC,
         "[%d.%d] slice nssai=%d.0x%06x (%s): %d RBs (%.1f%% of %d), used %s\n",
         params->frame,
@@ -385,8 +390,8 @@ int nr_dl_log_slice_usage(const nr_dl_sched_params_t *params,
   // stat_rbs_avail is accumulated once per slot for every configured slice in
   // nr_dl_two_level_scheduler() (not here), so it reflects the whole reporting window's total
   // RBs regardless of which slice actually won each slot -- see that function for why.
-  for (int c = 0; c < group->count; c++) {
-    const nr_dl_candidate_t *cand = &group->candidates[c];
+  for (int c = 0; c < n_candidates; c++) {
+    const nr_dl_candidate_t *cand = &candidates[c];
     if (cand->scheduled)
       LOG_D(NR_MAC,
             "[%d.%d] UE rnti=%04x: RBs [%d, %d) (%d RBs)\n",
@@ -440,27 +445,52 @@ void nr_dl_restrict_candidate_to_slice(const nr_slice_config_t *slice_config, in
   if (candidate->is_retx)
     return;
 
+  const nr_slice_t *winner = &slice_config->s[winner_idx];
   NR_UE_sched_ctrl_t *sched_ctrl = &candidate->UE->UE_sched_ctrl;
   // only pulls RLC data from LCIDs in the winning slice
   for (int lcid = 0; lcid < NR_MAX_NUM_LCID; lcid++) {
     if (candidate->pending_bytes_per_lcid[lcid] == 0)
       continue;
     const nr_lc_config_t *c = nr_mac_get_lc_config(sched_ctrl, lcid);
-    if (!c || !nr_slice_lc_matches(slice_config, winner_idx, c->nssai))
+    if (!c || !nr_slice_lc_matches(slice_config, winner_idx, c->nssai)) {
       candidate->pending_bytes_per_lcid[lcid] = 0;
+    } else {
+      LOG_D(NR_MAC,
+            "UE rnti=%04x: slice nssai=%d.0x%06x (%s) turn -- pulling LCID %d (nssai=%d.0x%06x) %d pending bytes\n",
+            candidate->rnti,
+            winner->nssai.sst,
+            winner->nssai.sd,
+            winner->label ? winner->label : "?",
+            lcid,
+            c->nssai.sst,
+            c->nssai.sd,
+            candidate->pending_bytes_per_lcid[lcid]);
+    }
   }
   candidate->pending_bytes = sched_ctrl->slice_pending_bytes[winner_idx];
-  candidate->nssai = slice_config->s[winner_idx].nssai;
+  candidate->nssai = winner->nssai;
 }
 
-void nr_dl_lcid_alloc_default(const gNB_MAC_INST *mac,
-                              const nr_dl_candidate_t *candidate,
-                              int tbs_available,
-                              int lcid_alloc[NR_MAX_NUM_LCID])
+// Slice-aware dl_lcid_alloc: only allocates bytes for LCIDs belonging to the candidate's winning slice
+void nr_dl_lcid_alloc_slice(const gNB_MAC_INST *mac,
+                            const nr_dl_candidate_t *candidate,
+                            int tbs_available,
+                            int lcid_alloc[NR_MAX_NUM_LCID])
 {
-  (void)mac;
   (void)tbs_available;
   memset(lcid_alloc, 0, NR_MAX_NUM_LCID * sizeof(int));
-  for (int lcid = 0; lcid < NR_MAX_NUM_LCID; lcid++)
+
+  const nr_slice_config_t *slice_config = &mac->slice_config;
+  int slice_idx = slice_config->num > 0 ? find_slice_idx_by_nssai(slice_config, candidate->nssai) : -1;
+  NR_UE_sched_ctrl_t *sched_ctrl = &candidate->UE->UE_sched_ctrl;
+  for (int lcid = 0; lcid < NR_MAX_NUM_LCID; lcid++) {
+    if (candidate->pending_bytes_per_lcid[lcid] == 0)
+      continue;
+    if (slice_idx >= 0) {
+      const nr_lc_config_t *c = nr_mac_get_lc_config(sched_ctrl, lcid);
+      if (!c || !nr_slice_lc_matches(slice_config, slice_idx, c->nssai))
+        continue;
+    }
     lcid_alloc[lcid] = candidate->pending_bytes_per_lcid[lcid];
+  }
 }

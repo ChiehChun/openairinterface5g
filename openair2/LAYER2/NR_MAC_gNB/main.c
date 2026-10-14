@@ -253,16 +253,15 @@ size_t dump_mac_stats(gNB_MAC_INST *gNB, char *output, size_t strlen, bool reset
       float budget_pct = slice->stat_rbs_avail > 0 ? 100.0 * slice->stat_rbs_budget / slice->stat_rbs_avail : 0.0;
       float used_pct = slice->stat_rbs_avail > 0 ? 100.0 * slice->stat_rbs_used / slice->stat_rbs_avail : 0.0;
       uint64_t unused_rbs = slice->stat_rbs_budget - slice->stat_rbs_used;
+      float unused_pct = slice->stat_rbs_avail > 0 ? 100.0 * unused_rbs / slice->stat_rbs_avail : 0.0;
       output = st_append(output,
                          end,
-                         ": budget %"PRIu64"/%"PRIu64" RBs (%.1f%%), used %"PRIu64
-                         " RBs (%.1f%%), unused %"PRIu64" RBs\n",
+                         ": budget %"PRIu64"/%"PRIu64" RBs (%.1f%%), used %.1f%%, unused %.1f%%\n",
                          slice->stat_rbs_budget,
                          slice->stat_rbs_avail,
                          budget_pct,
-                         slice->stat_rbs_used,
                          used_pct,
-                         unused_rbs);
+                         unused_pct);
       slice->stat_rbs_budget = 0;
       slice->stat_rbs_used = 0;
       slice->stat_rbs_avail = 0;

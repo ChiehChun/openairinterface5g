@@ -78,10 +78,9 @@ int nr_dl_nvs(const nr_dl_sched_params_t *params,
     nr_dl_restrict_candidate_to_slice(slice_config, winner, &candidates[i]);
 
   /* Winner gets the whole slot as its budget -- NVS arbitrates in the time domain, not frequency */
-  const nr_dl_group_t winner_group = {.slice_idx = winner, .candidates = candidates, .count = n_candidates};
-  nr_dl_log_group_budget(params, slice_config, &winner_group, bwp_size - rb_used, bwp_size);
+  nr_dl_log_group_budget(params, slice_config, winner, bwp_size - rb_used, bwp_size);
   n_scheduled += nr_dl_schedule_newtx_budgeted(params, candidates, n_candidates, bwp_size, &rb_used);
-  nr_dl_log_slice_usage(params, slice_config, &winner_group, bwp_size);
+  nr_dl_log_slice_usage(params, slice_config, winner, candidates, n_candidates, bwp_size);
 
   return n_scheduled;
 }

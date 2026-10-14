@@ -36,11 +36,39 @@ nr_slice_rrm_ratio_params_t *nr_slice_rrm_ratio_params_new(int dedicated_ratio, 
   return p;
 }
 
-// Per-slice WRR runtime state
 typedef struct {
-  float credit;
-  int slots_won_in_frame; // hard cap enforcement, see nr_dl_rrm_ratio()
+  int slots_in_window;
+  int slots_won;
+  uint32_t last_rbs;
+
+  /* Persistent fractional carryover per tier (Bresenham/DDA-style), fed by owe_slots() at every
+   * window reset -- see nr_dl_rrm_ratio(). A slice owed e.g. 1.8 slots/window (dl_slots_per_frame
+   * * ratio/100) gets 2 slots most windows and 1 slot occasionally, converging to *exactly* its
+   * configured ratio over many windows. This replaces a per-window Largest Remainder Method
+   * (floor() + hand the few leftover slots to whichever slice has the biggest fractional
+   * remainder that window): with static ratios and a constant dl_slots_per_frame, LRM computes
+   * the identical remainder ordering every single window, so the same slice wins that "bonus"
+   * slot forever and a smaller-share neighbor loses it forever -- a permanent bias, not just a
+   * one-window rounding artifact. Carrying the fraction forward per-slice instead means every
+   * slice eventually cashes in its own accumulated fraction, with no cross-slice bias. */
+  float ded_owed;
+  float min_owed;
+  float max_owed;
+
+  int ded_target;
+  int min_target;
+  int max_target;
 } nr_rrm_ratio_state_t;
+
+/* Grants this window's target slot count for one ratio/tier, carrying the fractional remainder
+ * forward in `*owed` instead of discarding it -- see nr_rrm_ratio_state_t. */
+static int owe_slots(float *owed, int total, int ratio)
+{
+  *owed += total * ratio / 100.0f;
+  int target = (int)*owed; /* floor, since *owed stays >= 0 */
+  *owed -= target;
+  return target;
+}
 
 int nr_dl_rrm_ratio(const nr_dl_sched_params_t *params,
                     nr_slice_config_t *slice_config,
@@ -52,94 +80,108 @@ int nr_dl_rrm_ratio(const nr_dl_sched_params_t *params,
   /* Handle retransmissions across all slices before any slice winner is decided */
   int n_scheduled = nr_dl_schedule_retx(params, candidates, n_candidates, bwp_size, &rb_used);
 
-  // The credit cap (below) only bounds how much a slice can *bank* while idle, which keeps the
-  // long-run win share close to max_ratio but doesn't hard-stop a slice from winning several
-  // slots in a row once it cashes that credit in. To actually never exceed max_ratio, track how
-  // many slots each slice has already won *this frame* and refuse it another win once it hits
-  // its max_ratio's share of this frame's DL slots -- reset at the start of every frame.
   const frame_structure_t *fs = &params->mac->frame_structure;
   const int dl_slots_per_frame = get_dl_slots_per_period(fs) * fs->numb_period_frame;
-  const bool new_frame = params->slot == 0;
 
-  /* Weighted Round-Robin (WRR): calculate every slice's credit by its min and max ratios. A
-   * slice that hasn't yet reached its min_ratio's worth of slots this frame gets absolute
-   * priority over slices only competing for extra above their own guarantee -- min_ratio is
-   * thus a hard per-frame floor, symmetric with max_ratio's hard per-frame cap above. Credit
-   * only breaks ties within whichever priority tier is competing this slot. */
-  bool had_data[NR_MAX_NUM_SLICES] = {0};
-  bool eligible[NR_MAX_NUM_SLICES] = {0}; /* has data and hasn't hit its max_ratio cap this frame */
-  bool below_min[NR_MAX_NUM_SLICES] = {0}; /* hasn't reached its min_ratio floor yet this frame */
-  float credit[NR_MAX_NUM_SLICES];
   for (int s = 0; s < slice_config->num; s++) {
-    nr_slice_t *slice = &slice_config->s[s];
-    const nr_slice_rrm_ratio_params_t *p = slice->algo_data;
-    if (!slice->algo_state) {
+    if (!slice_config->s[s].algo_state) {
       nr_rrm_ratio_state_t *st = calloc(1, sizeof(*st));
       AssertFatal(st, "out of memory\n");
-      slice->algo_state = st;
-    }
-    nr_rrm_ratio_state_t *st = slice->algo_state;
-    if (new_frame)
-      st->slots_won_in_frame = 0;
-    st->credit = min(st->credit + p->min_ratio, (float)p->max_ratio);
-    credit[s] = st->credit;
-
-    int min_slots = dl_slots_per_frame * p->min_ratio / 100;
-    int max_slots = dl_slots_per_frame * p->max_ratio / 100;
-    had_data[s] = nr_dl_slice_pending_bytes(s, candidates, n_candidates) > 0;
-    eligible[s] = had_data[s] && st->slots_won_in_frame < max_slots;
-    below_min[s] = st->slots_won_in_frame < min_slots;
-  }
-
-  /* Pass 1: prefer an eligible slice still below its min_ratio floor. Pass 2: only if none
-   * qualified (everyone with data already met their floor, or nobody has data), fall back to
-   * normal credit-based competition among all eligible slices. */
-  int winner = -1;
-  float winner_credit = 0.0f;
-  for (int s = 0; s < slice_config->num; s++) {
-    if (!eligible[s] || !below_min[s])
-      continue;
-    if (winner < 0 || credit[s] > winner_credit) {
-      winner = s;
-      winner_credit = credit[s];
+      slice_config->s[s].algo_state = st;
     }
   }
-  if (winner < 0) {
+
+  /* Every slice's algo_state is touched exactly once per call (here, and in the scoring loop
+   * below), so their slots_in_window counters stay in lockstep -- checking slice 0 alone is
+   * enough to detect a window boundary for all of them. */
+  nr_rrm_ratio_state_t *st0 = slice_config->s[0].algo_state;
+  bool window_reset = ++st0->slots_in_window > dl_slots_per_frame;
+  for (int s = 1; s < slice_config->num; s++)
+    ((nr_rrm_ratio_state_t *)slice_config->s[s].algo_state)->slots_in_window = st0->slots_in_window;
+
+  if (window_reset) {
     for (int s = 0; s < slice_config->num; s++) {
-      if (!eligible[s])
-        continue;
-      if (winner < 0 || credit[s] > winner_credit) {
-        winner = s;
-        winner_credit = credit[s];
-      }
+      nr_slice_t *slice = &slice_config->s[s];
+      nr_rrm_ratio_state_t *st = slice->algo_state;
+      // Once per window (not per slot): shows whether last window's apportioned targets were met.
+      LOG_D(NR_MAC,
+            "[%d.%d] slice nssai=%d.0x%06x (%s): won %d/%d slots last window (ded_target=%d min_target=%d "
+            "dl_slots_per_frame=%d) last_rbs=%u\n",
+            params->frame,
+            params->slot,
+            slice->nssai.sst,
+            slice->nssai.sd,
+            slice->label ? slice->label : "?",
+            st->slots_won,
+            st->max_target,
+            st->ded_target,
+            st->min_target,
+            dl_slots_per_frame,
+            st->last_rbs);
+      st->slots_in_window = 1;
+      st->slots_won = 0;
+      st->last_rbs = 0;
+
+      const nr_slice_rrm_ratio_params_t *p = slice->algo_data;
+      st->ded_target = owe_slots(&st->ded_owed, dl_slots_per_frame, p->dedicated_ratio);
+      st->min_target = owe_slots(&st->min_owed, dl_slots_per_frame, p->min_ratio);
+      st->max_target = owe_slots(&st->max_owed, dl_slots_per_frame, p->max_ratio);
+    }
+  }
+
+  /* Score-based slice selection (ported from epr_nr_dl()): a slice below its apportioned
+   * ded_target gets absolute priority (reserved outright, granted even without current demand --
+   * TS 28.541 dedicated_ratio is exclusive, unlike min/max); below min_target it gets priority
+   * over slices only competing for extra above their guarantee; below max_target it's only
+   * opportunistically eligible. The min/max tiers additionally require live pending-byte demand
+   * (nr_dl_slice_pending_bytes()) -- stronger than epr's original last-window-usage check -- and
+   * are ranked by how many RBs the slice actually used last time it won. A slice with no eligible
+   * tier this call does not win, even if every other slice is capped -- unlike epr_nr_dl(), which
+   * could pick a zero-score slice by default (see the "Bug: ... could not find PUCCH for DL DCI"
+   * comment in that function). The tie-break among multiple slices below their ded_target this
+   * same call is just "biggest absolute remaining count wins" -- unlike ded_target/min_target/
+   * max_target themselves, this ordering doesn't need to be fairness-aware, since each slice's
+   * own owe_slots() carryover already guarantees its long-run share regardless of who goes
+   * first on any particular call. */
+  int winner = -1;
+  float best_score = 0.0f;
+  for (int s = 0; s < slice_config->num; s++) {
+    nr_slice_t *slice = &slice_config->s[s];
+    nr_rrm_ratio_state_t *st = slice->algo_state;
+
+    if (st->slots_won >= st->max_target)
+      continue; /* hard per-window cap reached: not eligible this window anymore */
+
+    bool had_demand = nr_dl_slice_pending_bytes(s, candidates, n_candidates) > 0;
+    float score = 0.0f;
+    if (st->slots_won < st->ded_target)
+      score = 10000.0f + (st->ded_target - st->slots_won);
+    else if (had_demand && st->slots_won < st->min_target)
+      score = 1000.0f + st->last_rbs + (st->min_target - st->slots_won);
+    else if (had_demand && st->slots_won < st->max_target)
+      score = 100.0f + st->last_rbs + (st->max_target - st->slots_won);
+
+    if (score > 0.0f && (winner < 0 || score > best_score)) {
+      winner = s;
+      best_score = score;
     }
   }
 
   if (winner < 0)
-    return n_scheduled; /* nothing to send, or every slice with data is already at its max_ratio cap for this frame */
+    return n_scheduled; /* nothing to send, or every slice with demand is already at its cap this window */
 
   nr_rrm_ratio_state_t *win_st = slice_config->s[winner].algo_state;
-  win_st->credit -= 100.0f; /* a deficit earned back over future slots */
-  win_st->slots_won_in_frame++;
+  win_st->slots_won++;
 
   /* Keep only the winning slice's data on each candidate */
   for (int i = 0; i < n_candidates; i++)
     nr_dl_restrict_candidate_to_slice(slice_config, winner, &candidates[i]);
 
   /* Winner gets the whole slot's remaining RBs */
-  const nr_dl_group_t winner_group = {.slice_idx = winner, .candidates = candidates, .count = n_candidates};
-  nr_dl_log_group_budget(params, slice_config, &winner_group, bwp_size - rb_used, bwp_size);
+  nr_dl_log_group_budget(params, slice_config, winner, bwp_size - rb_used, bwp_size);
   /* Handle new transmission */
   n_scheduled += nr_dl_schedule_newtx_budgeted(params, candidates, n_candidates, bwp_size, &rb_used);
-  nr_dl_log_slice_usage(params, slice_config, &winner_group, bwp_size);
-
-  /* log a zero budget for every other slice that had data but lost this round */
-  // for (int s = 0; s < slice_config->num; s++) {
-  //   if (s == winner || !had_data[s])
-  //     continue;
-  //   const nr_dl_group_t lost_group = {.slice_idx = s, .candidates = candidates, .count = 0};
-  //   nr_dl_log_group_budget(params, slice_config, &lost_group, 0, bwp_size);
-  // }
+  win_st->last_rbs = nr_dl_log_slice_usage(params, slice_config, winner, candidates, n_candidates, bwp_size);
 
   return n_scheduled;
 }

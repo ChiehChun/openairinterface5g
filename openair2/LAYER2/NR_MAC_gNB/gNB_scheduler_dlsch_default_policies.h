@@ -29,6 +29,11 @@ void nr_dl_lcid_alloc_default(const gNB_MAC_INST *mac,
                               int tbs_available,
                               int lcid_alloc[NR_MAX_NUM_LCID]);
 
+void nr_dl_lcid_alloc_slice(const gNB_MAC_INST *mac,
+                            const nr_dl_candidate_t *candidate,
+                            int tbs_available,
+                            int lcid_alloc[NR_MAX_NUM_LCID]);
+
 int nr_dl_two_level_scheduler(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates);
 
 int nr_dl_proportional_fair_budgeted(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates, int rb_budget);
@@ -37,9 +42,9 @@ int nr_dl_schedule_retx(const nr_dl_sched_params_t *params, nr_dl_candidate_t *c
 
 int nr_dl_schedule_newtx_budgeted(const nr_dl_sched_params_t *params, nr_dl_candidate_t *candidates, int n_candidates, int rb_budget, int *rb_used);
 
-void nr_dl_log_group_budget(const nr_dl_sched_params_t *params, nr_slice_config_t *slice_config, const nr_dl_group_t *group, int rb_budget, int bwp_size);
+void nr_dl_log_group_budget(const nr_dl_sched_params_t *params, nr_slice_config_t *slice_config, int slice_idx, int rb_budget, int bwp_size);
 
-int nr_dl_log_slice_usage(const nr_dl_sched_params_t *params, nr_slice_config_t *slice_config, const nr_dl_group_t *group, int bwp_size);
+int nr_dl_log_slice_usage(const nr_dl_sched_params_t *params, nr_slice_config_t *slice_config, int slice_idx, const nr_dl_candidate_t *candidates, int n_candidates, int bwp_size);
 
 uint32_t nr_dl_slice_pending_bytes(int slice_idx, nr_dl_candidate_t *candidates, int n_candidates);
 

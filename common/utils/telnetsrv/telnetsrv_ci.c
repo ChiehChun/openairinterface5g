@@ -519,6 +519,8 @@ static int slice_add(char *buf, int debug, telnet_printfunc_t prnt)
   mac->dl_slice_algo = target_algo;
   if (mac->dl_rb_alloc != nr_dl_two_level_scheduler)
     mac->dl_rb_alloc = nr_dl_two_level_scheduler;
+  if (mac->dl_lcid_alloc != nr_dl_lcid_alloc_slice)
+    mac->dl_lcid_alloc = nr_dl_lcid_alloc_slice;
   if (target_algo == nr_dl_rrm_ratio)
     nr_slicing_ensure_default_slice_rrm(&mac->slice_config);
   else
@@ -565,11 +567,19 @@ static int slice_remove(char *buf, int debug, telnet_printfunc_t prnt)
   nssai_t nssai = {.sst = sst, .sd = sd};
   NR_SCHED_LOCK(&mac->sched_lock);
   int removed = nr_slicing_remove_slice(&mac->slice_config, nssai);
-  if (removed && mac->slice_config.num > 0) {
-    if (mac->dl_slice_algo == nr_dl_rrm_ratio)
-      nr_slicing_ensure_default_slice_rrm(&mac->slice_config);
-    else if (mac->dl_slice_algo == nr_dl_nvs)
-      nr_slicing_ensure_default_slice_nvs(&mac->slice_config);
+  if (removed) {
+    bool only_default_left =
+        mac->slice_config.num == 1 && mac->slice_config.s[0].nssai.sst == 0 && mac->slice_config.s[0].nssai.sd == 0;
+    if (only_default_left) {
+      nr_slicing_clear(&mac->slice_config);
+      mac->dl_rb_alloc = nr_dl_proportional_fair;
+      mac->dl_lcid_alloc = nr_dl_lcid_alloc_default;
+    } else if (mac->slice_config.num > 0) {
+      if (mac->dl_slice_algo == nr_dl_rrm_ratio)
+        nr_slicing_ensure_default_slice_rrm(&mac->slice_config);
+      else if (mac->dl_slice_algo == nr_dl_nvs)
+        nr_slicing_ensure_default_slice_nvs(&mac->slice_config);
+    }
   }
   NR_SCHED_UNLOCK(&mac->sched_lock);
 
